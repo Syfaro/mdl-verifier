@@ -12,5 +12,5 @@ Features:
 
 ## Running
 
-A sample app is provded in bin/verifier.rs, it requires a serial barcode scanner
-and optionally an NFC reader compatible with libnfc.
+A sample app is provded in examples/verifier.rs, it requires a serial barcode
+scanner and optionally an NFC reader compatible with libnfc.

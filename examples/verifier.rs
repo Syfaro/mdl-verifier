@@ -1,9 +1,14 @@
-use std::{path::PathBuf, time::Duration};
+use std::{ffi::OsStr, path::PathBuf, time::Duration};
 
 use clap::Parser;
 use futures::Stream;
-use tokio::{io::AsyncReadExt, select, sync::mpsc::channel, time::interval};
-use tokio_serial::SerialPortBuilderExt;
+use tokio::{
+    io::AsyncReadExt,
+    select,
+    sync::mpsc::{Sender, channel},
+    time::interval,
+};
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, level_filters::LevelFilter};
 use tracing_subscriber::EnvFilter;
@@ -42,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut events = mdl_verifier::start(
         mdl_verifier::Config {
-            certificate_pem_data: Vec::new(),
+            certificate_pem_data: load_certificates(config.certificates_path).await?,
             nfc_connstring: config.nfc_connstring,
         },
         scanner_stream,
@@ -56,51 +61,67 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn load_certificates(path: PathBuf) -> anyhow::Result<Vec<String>> {
+    let mut certificate_pem_data = Vec::new();
+    let mut entries = tokio::fs::read_dir(path).await?;
+    while let Ok(Some(file)) = entries.next_entry().await {
+        if file.path().extension() != Some(OsStr::new("pem")) {
+            continue;
+        }
+        debug!(path = %file.path().display(), "loading certificate");
+        let mut file = tokio::fs::File::open(file.path()).await?;
+        let mut data = String::new();
+        file.read_to_string(&mut data).await?;
+        certificate_pem_data.push(data);
+    }
+    Ok(certificate_pem_data)
+}
+
 async fn create_scanner_stream(
     path: String,
     baud: u32,
 ) -> anyhow::Result<impl Stream<Item = String>> {
+    let port = tokio_serial::new(&path, baud).open_native_async()?;
     let (tx, rx) = channel(1);
-
-    let mut port = tokio_serial::new(&path, baud).open_native_async()?;
-
-    tokio::spawn(async move {
-        let mut interval = interval(Duration::from_millis(50));
-        let mut str_buf = String::new();
-        let mut buf = [0u8; 4096];
-
-        loop {
-            select! {
-                _ = interval.tick() => {
-                    if str_buf.is_empty() {
-                        continue;
-                    }
-
-                    let final_value = std::mem::take(&mut str_buf);
-                    let final_value = final_value.trim_end_matches(['\r', '\n']).to_string();
-
-                    debug!("sending scanner value: {final_value}");
-                    tx.send(final_value).await.unwrap();
-                }
-
-                _ = tx.closed() => {
-                    break;
-                }
-
-                res = port.read(&mut buf) => {
-                    let size = res.unwrap();
-                    if size == 0 {
-                        continue;
-                    }
-
-                    let s = String::from_utf8_lossy(&buf[0..size]);
-                    str_buf.push_str(&s);
-
-                    interval.reset();
-                }
-            }
-        }
-    });
+    tokio::spawn(scanner_loop(port, tx));
 
     Ok(ReceiverStream::new(rx))
+}
+
+async fn scanner_loop(mut port: SerialStream, tx: Sender<String>) {
+    let mut interval = interval(Duration::from_millis(50));
+    let mut str_buf = String::new();
+    let mut buf = [0u8; 4096];
+
+    loop {
+        select! {
+            _ = interval.tick() => {
+                if str_buf.is_empty() {
+                    continue;
+                }
+
+                let final_value = std::mem::take(&mut str_buf);
+                let final_value = final_value.trim_end_matches(['\r', '\n']).to_string();
+
+                debug!("sending scanner value: {final_value}");
+                tx.send(final_value).await.unwrap();
+            }
+
+            _ = tx.closed() => {
+                break;
+            }
+
+            res = port.read(&mut buf) => {
+                let size = res.unwrap();
+                if size == 0 {
+                    continue;
+                }
+
+                let s = String::from_utf8_lossy(&buf[0..size]);
+                str_buf.push_str(&s);
+
+                interval.reset();
+            }
+        }
+    }
 }
