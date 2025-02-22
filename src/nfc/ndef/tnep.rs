@@ -22,7 +22,7 @@ impl ServiceParameter {
         let service_name_len = data.next().ok_or_eyre("missing service_name_len byte")?;
         let service_name: Vec<u8> = data.by_ref().take(service_name_len.into()).collect();
         eyre::ensure!(
-            service_name.len() == service_name_len.into(),
+            service_name.len() == usize::from(service_name_len),
             "not enough bytes to fill service_name"
         );
         let service_name = String::from_utf8(service_name)?;

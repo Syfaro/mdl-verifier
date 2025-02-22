@@ -80,7 +80,7 @@ impl HandoverSelect {
         let carrier_data_reference: Vec<_> =
             data.by_ref().take(carrier_data_ref_len as usize).collect();
         eyre::ensure!(
-            carrier_data_reference.len() == carrier_data_ref_len.into(),
+            carrier_data_reference.len() == usize::from(carrier_data_ref_len),
             "not enough bytes to fill carrier_data_ref"
         );
         trace!(carrier_data_reference = hex::encode(&carrier_data_reference));
@@ -94,7 +94,7 @@ impl HandoverSelect {
             trace!(aux_data_ref_len);
             let aux_data_ref: Vec<_> = data.by_ref().take(aux_data_ref_len.into()).collect();
             eyre::ensure!(
-                aux_data_ref.len() == aux_data_ref_len.into(),
+                aux_data_ref.len() == usize::from(aux_data_ref_len),
                 "not enough bytes to fill aux_data_ref"
             );
             trace!(aux_data_ref = hex::encode(&aux_data_ref));
@@ -190,7 +190,10 @@ impl BLECarrierConfiguration {
         Self {
             data: vec![
                 (0x1C, vec![le_role as u8]),
-                (0x07, service_address.to_bytes_le().to_vec()),
+                (
+                    0x07,
+                    service_address.as_bytes().iter().copied().rev().collect(),
+                ),
             ],
         }
     }
@@ -259,7 +262,7 @@ impl BLECarrierConfiguration {
     #[allow(dead_code)]
     pub fn service_uuid(&self) -> Option<Uuid> {
         self.get_by_type(0x07)
-            .and_then(|data| Uuid::from_slice_le(data).ok())
+            .and_then(|data| Uuid::from_slice(&data.iter().copied().rev().collect::<Vec<_>>()).ok())
     }
 }
 

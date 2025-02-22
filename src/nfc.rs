@@ -1,14 +1,16 @@
 use std::{collections::HashMap, time::Duration};
 
+use eyre::OptionExt;
 use nfc1::{
     Context, Device, Modulation, Target,
     target_info::{Iso14443a, TargetInfo},
 };
-use tracing::{debug, info, instrument, trace};
+use tracing::{debug, error, info, instrument, trace};
 
-mod ndef;
+pub mod ndef;
 
 use ndef::{IntoNdefRecord, KnownNdefRecord};
+use uuid::Uuid;
 
 const T4T_CLASS: u8 = 0x00;
 
@@ -31,6 +33,67 @@ static MODULATION: Modulation = Modulation {
 
 pub struct NfcReader<'a> {
     device: Device<'a>,
+
+    last_handover_request: Option<Vec<u8>>,
+}
+
+pub fn start_nfc_thread(
+    connstring: String,
+) -> eyre::Result<tokio::sync::mpsc::Receiver<NegotiatedConnection>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+    std::thread::Builder::new()
+        .name("nfc-poller".to_string())
+        .spawn(move || {
+            let mut context = nfc1::Context::new().expect("failed to create nfc context");
+            let mut nfc_reader =
+                NfcReader::new(&mut context, &connstring).expect("failed to create nfc reader");
+
+            loop {
+                let info = match nfc_reader.poll_14a() {
+                    Ok(Some(info)) => info,
+                    Ok(None) => {
+                        trace!("no tag found");
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                    Err(err) => {
+                        error!("error polling nfc reader: {err}");
+                        break;
+                    }
+                };
+
+                let connection = match nfc_reader.get_18013_5_device_engagement(info) {
+                    Ok(connection) => connection,
+                    Err(err) => {
+                        error!("error fetching engagement: {err}");
+                        continue;
+                    }
+                };
+
+                info!(
+                    le_role = ?connection.le_role,
+                    service_uuid = %connection.service_uuid,
+                    "got connection details"
+                );
+
+                if let Err(err) = tx.blocking_send(connection) {
+                    error!("failed to send connection information: {err}");
+                    break;
+                }
+            }
+        })?;
+
+    Ok(rx)
+}
+
+#[derive(Debug)]
+pub struct NegotiatedConnection {
+    pub le_role: ndef::handover::BLERole,
+    pub service_uuid: Uuid,
+    pub device_engagement: Vec<u8>,
+    pub handover_select: Vec<u8>,
+    pub handover_request: Option<Vec<u8>>,
 }
 
 impl<'a> NfcReader<'a> {
@@ -40,7 +103,10 @@ impl<'a> NfcReader<'a> {
         device.initiator_init()?;
         info!(name = device.name(), "opened nfc device");
 
-        Ok(Self { device })
+        Ok(Self {
+            device,
+            last_handover_request: None,
+        })
     }
 
     pub fn poll_14a(&mut self) -> eyre::Result<Option<Iso14443a>> {
@@ -63,10 +129,15 @@ impl<'a> NfcReader<'a> {
     }
 
     #[instrument(skip_all, fields(uid))]
-    pub fn get_18013_5_device_engagement(&mut self, info: Iso14443a) -> eyre::Result<()> {
+    pub fn get_18013_5_device_engagement(
+        &mut self,
+        info: Iso14443a,
+    ) -> eyre::Result<NegotiatedConnection> {
         let uid = info.uid[..info.uid_len].to_vec();
         tracing::Span::current().record("uid", hex::encode(&uid));
         debug!("got device uid");
+
+        self.last_handover_request = None;
 
         self.select_app(&NDEF_AID)?;
         self.select_file(NDEF_CC_FILE)?;
@@ -81,13 +152,11 @@ impl<'a> NfcReader<'a> {
         let ndef_file_data = self.read_file_ndef(ndef_file_id)?;
         trace!("got ndef file data: {}", hex::encode(&ndef_file_data));
 
-        self.process_ndef_data(ndef_file_data)?;
-
-        todo!()
+        self.process_ndef_data(ndef_file_data)
     }
 
-    fn process_ndef_data(&mut self, ndef_file_data: Vec<u8>) -> eyre::Result<()> {
-        let records = ndef::RawNdefRecord::decode_many(&mut ndef_file_data.into_iter())?
+    fn process_ndef_data(&mut self, ndef_file_data: Vec<u8>) -> eyre::Result<NegotiatedConnection> {
+        let records = ndef::RawNdefRecord::decode_many(&mut ndef_file_data.clone().into_iter())?
             .into_iter()
             .map(ndef::KnownNdefRecord::parse)
             .collect::<Result<Vec<_>, _>>()?;
@@ -127,6 +196,7 @@ impl<'a> NfcReader<'a> {
                     );
 
                     let service_address = uuid::Uuid::new_v4();
+                    trace!(%service_address, "created service address");
                     let messages = vec![
                         ndef::handover::HandoverRequest {
                             version: param.version,
@@ -139,7 +209,7 @@ impl<'a> NfcReader<'a> {
                         }
                         .ndef_record(),
                         ndef::handover::BLECarrierConfiguration::new(
-                            ndef::handover::BLERole::Peripheral,
+                            ndef::handover::BLERole::Central,
                             service_address,
                         )
                         .carrier_configuration()
@@ -154,25 +224,43 @@ impl<'a> NfcReader<'a> {
                         ),
                     ];
                     let message_data = ndef::merge_messages(messages);
+                    self.last_handover_request = Some(message_data.clone());
                     self.update_file_ndef(message_data)?;
 
                     let ndef_file_data = self.read_current_file_ndef()?;
                     trace!("got ndef file data: {}", hex::encode(&ndef_file_data));
-                    self.process_ndef_data(ndef_file_data)?;
+                    return self.process_ndef_data(ndef_file_data);
                 }
                 KnownNdefRecord::HandoverSelect(select) => {
                     debug!("got handover select: {select:?}");
 
                     for alt_carrier in select.alternative_carriers {
-                        if let Some(record) = records_by_id.get(&alt_carrier.carrier_data_reference)
-                        {
-                            debug!("select referenced carrier: {record:?}");
-                        }
+                        let Some(KnownNdefRecord::BluetoothCarrierConfiguration(ble_config)) =
+                            records_by_id
+                                .get(&alt_carrier.carrier_data_reference)
+                                .cloned()
+                        else {
+                            continue;
+                        };
 
                         for aux_ref in alt_carrier.auxiliary_data_references {
-                            if let Some(record) = records_by_id.get(&aux_ref) {
-                                debug!("carrier referenced aux data: {record:?}");
-                            }
+                            let Some(KnownNdefRecord::DeviceEngagement(device_engagement)) =
+                                records_by_id.get(&aux_ref).cloned()
+                            else {
+                                continue;
+                            };
+
+                            return Ok(NegotiatedConnection {
+                                le_role: ble_config
+                                    .le_role()
+                                    .ok_or_eyre("ble carrier must be le role")?,
+                                service_uuid: ble_config
+                                    .service_uuid()
+                                    .ok_or_eyre("ble carrier must have service uuid")?,
+                                device_engagement,
+                                handover_select: ndef_file_data,
+                                handover_request: std::mem::take(&mut self.last_handover_request),
+                            });
                         }
                     }
                 }
@@ -182,7 +270,7 @@ impl<'a> NfcReader<'a> {
             }
         }
 
-        Ok(())
+        eyre::bail!("finished records and didn't find reader engagement")
     }
 
     #[instrument(skip_all)]
@@ -281,7 +369,7 @@ impl<'a> NfcReader<'a> {
             offset += chunk_size as u16;
         }
         eyre::ensure!(
-            ndef_file_data.len() == ndef_file_len.into(),
+            ndef_file_data.len() == usize::from(ndef_file_len),
             "ndef file should be reported length"
         );
 

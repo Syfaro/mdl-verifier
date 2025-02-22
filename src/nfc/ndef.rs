@@ -27,7 +27,7 @@ pub enum KnownNdefRecord {
     TnepStatus(tnep::Status),
     HandoverSelect(handover::HandoverSelect),
     BluetoothCarrierConfiguration(handover::BLECarrierConfiguration),
-    ReaderEngagement(Vec<u8>),
+    DeviceEngagement(Vec<u8>),
     Unknown(RawNdefRecord),
 }
 
@@ -58,7 +58,7 @@ impl KnownNdefRecord {
             (TypeNameFormat::External, b"iso.org:18013:deviceengagement")
                 if record.id_data.as_deref() == Some(b"mdoc") =>
             {
-                Ok(KnownNdefRecord::ReaderEngagement(record.payload_data))
+                Ok(KnownNdefRecord::DeviceEngagement(record.payload_data))
             }
             _ => Ok(KnownNdefRecord::Unknown(record)),
         }?;
@@ -166,7 +166,7 @@ impl RawNdefRecord {
             String::from_utf8_lossy(&type_data)
         );
         eyre::ensure!(
-            type_data.len() == type_length.into(),
+            type_data.len() == usize::from(type_length),
             "not enough bytes for type_data"
         );
 
@@ -178,7 +178,7 @@ impl RawNdefRecord {
                 String::from_utf8_lossy(&id_data)
             );
             eyre::ensure!(
-                id_data.len() == id_length.into(),
+                id_data.len() == usize::from(id_length),
                 "not enough bytes for id_data"
             );
             Some(id_data)
@@ -196,7 +196,7 @@ impl RawNdefRecord {
             String::from_utf8_lossy(&payload_data)
         );
         eyre::ensure!(
-            payload_data.len() == payload_length.try_into().unwrap(),
+            payload_data.len() == usize::try_from(payload_length).unwrap(),
             "not enough bytes for payload_data"
         );
 
