@@ -26,7 +26,7 @@ struct Config {
 }
 
 #[tokio::main]
-async fn main() -> eyre::Result<()> {
+async fn main() -> anyhow::Result<()> {
     let config = Config::parse();
 
     tracing_subscriber::fmt::fmt()
@@ -59,7 +59,7 @@ async fn main() -> eyre::Result<()> {
 async fn create_scanner_stream(
     path: String,
     baud: u32,
-) -> eyre::Result<impl Stream<Item = String>> {
+) -> anyhow::Result<impl Stream<Item = String>> {
     let (tx, rx) = channel(1);
 
     let mut port = tokio_serial::new(&path, baud).open_native_async()?;

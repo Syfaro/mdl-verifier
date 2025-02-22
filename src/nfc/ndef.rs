@@ -1,5 +1,6 @@
-use eyre::OptionExt;
 use tracing::{error, instrument, trace};
+
+use crate::nfc::{NfcError, ensure_length, get_byte, get_bytes};
 
 pub mod handover;
 pub mod tnep;
@@ -34,7 +35,7 @@ pub enum KnownNdefRecord {
 pub type IdAndKnownRecord = (Option<Vec<u8>>, KnownNdefRecord);
 
 impl KnownNdefRecord {
-    pub fn parse(record: RawNdefRecord) -> eyre::Result<IdAndKnownRecord> {
+    pub fn parse(record: RawNdefRecord) -> Result<IdAndKnownRecord, NfcError> {
         let id = record.id_data.clone();
 
         let known_record = match (record.type_name_format, record.type_data.as_slice()) {
@@ -86,7 +87,7 @@ pub struct RawNdefRecord {
 
 impl RawNdefRecord {
     #[instrument(skip_all)]
-    pub fn decode_many<Iter>(data: &mut Iter) -> eyre::Result<Vec<Self>>
+    pub fn decode_many<Iter>(data: &mut Iter) -> Result<Vec<Self>, NfcError>
     where
         Iter: Iterator<Item = u8>,
     {
@@ -102,14 +103,11 @@ impl RawNdefRecord {
     }
 
     #[instrument(skip_all)]
-    pub fn decode_single<Iter>(data: &mut Iter) -> eyre::Result<Self>
+    pub fn decode_single<Iter>(data: &mut Iter) -> Result<Self, NfcError>
     where
         Iter: Iterator<Item = u8>,
     {
-        let Some(header) = data.next() else {
-            eyre::bail!("missing header");
-        };
-
+        let header = get_byte!(data, "header");
         let message_begin = Self::u8_to_bool(header & 0b10000000);
         let message_end = Self::u8_to_bool(header & 0b01000000);
         let chunk_flag = Self::u8_to_bool(header & 0b00100000);
@@ -138,22 +136,14 @@ impl RawNdefRecord {
             _ => unreachable!("type_name_format is only 3 bits"),
         };
 
-        let Some(type_length) = data.next() else {
-            eyre::bail!("missing type_length");
-        };
+        let type_length = get_byte!(data, "type_length");
         let payload_length: u32 = if short_record {
-            data.next().ok_or_eyre("missing payload_length")?.into()
+            get_byte!(data, "payload_length").into()
         } else {
-            let bytes: [u8; 4] = data
-                .by_ref()
-                .take(4)
-                .collect::<Vec<_>>()
-                .try_into()
-                .map_err(|_| eyre::eyre!("not enough bytes for payload_length"))?;
-            u32::from_be_bytes(bytes)
+            u32::from_be_bytes(get_bytes!(data, 4, "payload_length"))
         };
         let id_length = if id_length_present {
-            Some(data.next().ok_or_eyre("missing id_length")?)
+            Some(get_byte!(data, "id_length"))
         } else {
             None
         };
@@ -165,10 +155,7 @@ impl RawNdefRecord {
             hex::encode(&type_data),
             String::from_utf8_lossy(&type_data)
         );
-        eyre::ensure!(
-            type_data.len() == usize::from(type_length),
-            "not enough bytes for type_data"
-        );
+        ensure_length!(type_data.len(), usize::from(type_length));
 
         let id_data: Option<Vec<u8>> = if let Some(id_length) = id_length {
             let id_data: Vec<u8> = data.by_ref().take(id_length.into()).collect();
@@ -177,10 +164,7 @@ impl RawNdefRecord {
                 hex::encode(&id_data),
                 String::from_utf8_lossy(&id_data)
             );
-            eyre::ensure!(
-                id_data.len() == usize::from(id_length),
-                "not enough bytes for id_data"
-            );
+            ensure_length!(id_data.len(), usize::from(id_length));
             Some(id_data)
         } else {
             None
@@ -195,10 +179,7 @@ impl RawNdefRecord {
             hex::encode(&payload_data),
             String::from_utf8_lossy(&payload_data)
         );
-        eyre::ensure!(
-            payload_data.len() == usize::try_from(payload_length).unwrap(),
-            "not enough bytes for payload_data"
-        );
+        ensure_length!(payload_data.len(), usize::try_from(payload_length).unwrap());
 
         Ok(Self {
             message_begin,

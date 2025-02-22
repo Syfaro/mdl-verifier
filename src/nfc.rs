@@ -1,10 +1,10 @@
 use std::{collections::HashMap, time::Duration};
 
-use eyre::OptionExt;
 use nfc1::{
     Context, Device, Modulation, Target,
     target_info::{Iso14443a, TargetInfo},
 };
+use thiserror::Error;
 use tracing::{debug, error, info, instrument, trace};
 
 pub mod ndef;
@@ -31,6 +31,79 @@ static MODULATION: Modulation = Modulation {
     baud_rate: nfc1::BaudRate::Baud106,
 };
 
+#[derive(Error, Debug)]
+pub enum NfcError {
+    #[error(transparent)]
+    Thread(std::io::Error),
+    #[error(transparent)]
+    LibNfc(#[from] nfc1::Error),
+    #[error("wrong data length, expected {expected} but got {got}")]
+    WrongDataLength { expected: usize, got: usize },
+    #[error("unexpected record type")]
+    UnexpectedRecord(ndef::KnownNdefRecord),
+    #[error("tnep error: {0}")]
+    TnepError(ndef::tnep::Status),
+    #[error("missing required data: {0}")]
+    MissingRequiredData(&'static str),
+    #[error(
+        "unexpected bytes, expecting {} but got {}",
+        hex::encode(expected),
+        hex::encode(got)
+    )]
+    UnexpectedBytes { expected: Vec<u8>, got: Vec<u8> },
+    #[error("got unknown data")]
+    UnknownData,
+}
+
+macro_rules! ensure_length {
+    ($expected:expr, $got:expr) => {
+        if $expected != $got {
+            return Err(crate::nfc::NfcError::WrongDataLength {
+                expected: $expected,
+                got: $got,
+            });
+        }
+    };
+}
+
+macro_rules! ensure_bytes {
+    ($expected:expr, $got:expr) => {
+        if $expected != $got {
+            return Err(crate::nfc::NfcError::UnexpectedBytes {
+                expected: $expected.to_vec(),
+                got: $got.to_vec(),
+            });
+        }
+    };
+}
+
+macro_rules! get_byte {
+    ($iter:expr, $name:expr) => {
+        match $iter.next() {
+            Some(byte) => byte,
+            None => return Err(crate::nfc::NfcError::MissingRequiredData($name)),
+        }
+    };
+}
+
+macro_rules! get_bytes {
+    ($iter:expr, $count:expr, $name:expr) => {{
+        let bytes: Vec<_> = $iter.by_ref().take($count).collect();
+        let bytes: [u8; $count] = match bytes.try_into() {
+            Ok(bytes) => bytes,
+            Err(data) => {
+                return Err(crate::nfc::NfcError::WrongDataLength {
+                    expected: $count,
+                    got: data.len(),
+                });
+            }
+        };
+        bytes
+    }};
+}
+
+pub(crate) use {ensure_bytes, ensure_length, get_byte, get_bytes};
+
 pub struct NfcReader<'a> {
     device: Device<'a>,
 
@@ -39,7 +112,7 @@ pub struct NfcReader<'a> {
 
 pub fn start_nfc_thread(
     connstring: String,
-) -> eyre::Result<tokio::sync::mpsc::Receiver<NegotiatedConnection>> {
+) -> Result<tokio::sync::mpsc::Receiver<NegotiatedConnection>, NfcError> {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
 
     std::thread::Builder::new()
@@ -82,7 +155,8 @@ pub fn start_nfc_thread(
                     break;
                 }
             }
-        })?;
+        })
+        .map_err(NfcError::Thread)?;
 
     Ok(rx)
 }
@@ -98,7 +172,7 @@ pub struct NegotiatedConnection {
 
 impl<'a> NfcReader<'a> {
     #[instrument(skip(context))]
-    pub fn new(context: &'a mut Context, connstring: &str) -> eyre::Result<NfcReader<'a>> {
+    pub fn new(context: &'a mut Context, connstring: &str) -> Result<NfcReader<'a>, NfcError> {
         let mut device = context.open_with_connstring(connstring)?;
         device.initiator_init()?;
         info!(name = device.name(), "opened nfc device");
@@ -109,9 +183,8 @@ impl<'a> NfcReader<'a> {
         })
     }
 
-    pub fn poll_14a(&mut self) -> eyre::Result<Option<Iso14443a>> {
+    pub fn poll_14a(&mut self) -> Result<Option<Iso14443a>, NfcError> {
         let mut targets = self.device.initiator_list_passive_targets(&MODULATION, 1)?;
-        eyre::ensure!(targets.len() <= 1, "at most one target should be returned");
 
         if let Some(Target {
             target_info: TargetInfo::Iso14443a(info),
@@ -132,7 +205,7 @@ impl<'a> NfcReader<'a> {
     pub fn get_18013_5_device_engagement(
         &mut self,
         info: Iso14443a,
-    ) -> eyre::Result<NegotiatedConnection> {
+    ) -> Result<NegotiatedConnection, NfcError> {
         let uid = info.uid[..info.uid_len].to_vec();
         tracing::Span::current().record("uid", hex::encode(&uid));
         debug!("got device uid");
@@ -143,10 +216,7 @@ impl<'a> NfcReader<'a> {
         self.select_file(NDEF_CC_FILE)?;
 
         let cc_data = self.read_file(0, 15)?;
-        eyre::ensure!(
-            cc_data.len() == 15,
-            "cc file read should have returned 15 bytes"
-        );
+        ensure_length!(cc_data.len(), 15);
 
         let ndef_file_id = Self::get_ndef_file_id_from_cc(&cc_data)?;
         let ndef_file_data = self.read_file_ndef(ndef_file_id)?;
@@ -155,7 +225,10 @@ impl<'a> NfcReader<'a> {
         self.process_ndef_data(ndef_file_data)
     }
 
-    fn process_ndef_data(&mut self, ndef_file_data: Vec<u8>) -> eyre::Result<NegotiatedConnection> {
+    fn process_ndef_data(
+        &mut self,
+        ndef_file_data: Vec<u8>,
+    ) -> Result<NegotiatedConnection, NfcError> {
         let records = ndef::RawNdefRecord::decode_many(&mut ndef_file_data.clone().into_iter())?
             .into_iter()
             .map(ndef::KnownNdefRecord::parse)
@@ -187,13 +260,13 @@ impl<'a> NfcReader<'a> {
                     let (_, known_record) = ndef::KnownNdefRecord::parse(
                         ndef::RawNdefRecord::decode_single(&mut ndef_file_data.into_iter())?,
                     )?;
-                    eyre::ensure!(
-                        matches!(
-                            known_record,
-                            ndef::KnownNdefRecord::TnepStatus(ndef::tnep::Status::Success)
-                        ),
-                        "tnep service select must be successful"
-                    );
+                    match known_record {
+                        ndef::KnownNdefRecord::TnepStatus(ndef::tnep::Status::Success) => (),
+                        ndef::KnownNdefRecord::TnepStatus(status) => {
+                            return Err(NfcError::TnepError(status));
+                        }
+                        other => return Err(NfcError::UnexpectedRecord(other)),
+                    }
 
                     let service_address = uuid::Uuid::new_v4();
                     trace!(%service_address, "created service address");
@@ -220,7 +293,7 @@ impl<'a> NfcReader<'a> {
                             ndef::TypeNameFormat::External,
                             b"iso.org:18013:readerengagement",
                             Some(b"mdocreader"),
-                            &crate::mdl::ReaderEngagement::default().encode()?,
+                            &crate::mdl::ReaderEngagement::default().encode().unwrap(),
                         ),
                     ];
                     let message_data = ndef::merge_messages(messages);
@@ -253,10 +326,10 @@ impl<'a> NfcReader<'a> {
                             return Ok(NegotiatedConnection {
                                 le_role: ble_config
                                     .le_role()
-                                    .ok_or_eyre("ble carrier must be le role")?,
+                                    .ok_or(NfcError::MissingRequiredData("le role"))?,
                                 service_uuid: ble_config
                                     .service_uuid()
-                                    .ok_or_eyre("ble carrier must have service uuid")?,
+                                    .ok_or(NfcError::MissingRequiredData("service uuid"))?,
                                 device_engagement,
                                 handover_select: ndef_file_data,
                                 handover_request: std::mem::take(&mut self.last_handover_request),
@@ -270,11 +343,11 @@ impl<'a> NfcReader<'a> {
             }
         }
 
-        eyre::bail!("finished records and didn't find reader engagement")
+        Err(NfcError::MissingRequiredData("reader engagement"))
     }
 
     #[instrument(skip_all)]
-    fn select_app(&mut self, aid: &[u8]) -> eyre::Result<()> {
+    fn select_app(&mut self, aid: &[u8]) -> Result<(), NfcError> {
         let mut select_app_req = vec![
             T4T_CLASS,
             T4T_INS_SELECT,
@@ -294,13 +367,13 @@ impl<'a> NfcReader<'a> {
             hex::encode(&select_app_resp)
         );
 
-        Self::check_status("select app", &select_app_resp)?;
+        Self::check_status(&select_app_resp)?;
 
         Ok(())
     }
 
     #[instrument(skip_all, fields(file_id = hex::encode(file_id.to_be_bytes())))]
-    fn select_file(&mut self, file_id: u16) -> eyre::Result<()> {
+    fn select_file(&mut self, file_id: u16) -> Result<(), NfcError> {
         let mut select_file_req = vec![T4T_CLASS, T4T_INS_SELECT, NDEF_FILE_SELECT, 0x0C, 0x02];
         select_file_req.extend_from_slice(&file_id.to_be_bytes());
         trace!("built request: {}", hex::encode(&select_file_req));
@@ -313,13 +386,13 @@ impl<'a> NfcReader<'a> {
             hex::encode(&select_file_resp)
         );
 
-        Self::check_status("select file", &select_file_resp)?;
+        Self::check_status(&select_file_resp)?;
 
         Ok(())
     }
 
     #[instrument(skip(self, offset), fields(offset = hex::encode(offset.to_be_bytes())))]
-    fn read_file(&mut self, offset: u16, length: u8) -> eyre::Result<Vec<u8>> {
+    fn read_file(&mut self, offset: u16, length: u8) -> Result<Vec<u8>, NfcError> {
         let mut read_file_req = vec![T4T_CLASS, T4T_INS_READ];
         read_file_req.extend_from_slice(&offset.to_be_bytes());
         read_file_req.push(length);
@@ -330,7 +403,7 @@ impl<'a> NfcReader<'a> {
                 .initiator_transceive_bytes(&read_file_req, 256, nfc1::Timeout::Default)?;
         trace!("got response from read: {}", hex::encode(&read_file_resp));
 
-        Self::check_status("read file", &read_file_resp)?;
+        Self::check_status(&read_file_resp)?;
 
         // Last two bytes are status, not part of the data.
         read_file_resp.truncate(read_file_resp.len() - 2);
@@ -338,19 +411,18 @@ impl<'a> NfcReader<'a> {
     }
 
     #[instrument(skip_all, fields(ndef_file_id))]
-    fn read_file_ndef(&mut self, ndef_file_id: u16) -> eyre::Result<Vec<u8>> {
-        tracing::Span::current().record("tlv_data", hex::encode(ndef_file_id.to_be_bytes()));
+    fn read_file_ndef(&mut self, ndef_file_id: u16) -> Result<Vec<u8>, NfcError> {
+        tracing::Span::current().record("ndef_file_id", hex::encode(ndef_file_id.to_be_bytes()));
         self.select_file(ndef_file_id)?;
 
         self.read_current_file_ndef()
     }
 
-    fn read_current_file_ndef(&mut self) -> eyre::Result<Vec<u8>> {
+    #[instrument(skip_all)]
+    fn read_current_file_ndef(&mut self) -> Result<Vec<u8>, NfcError> {
         let ndef_file_len_data = self.read_file(0, 2)?;
-        eyre::ensure!(
-            ndef_file_len_data.len() == 2,
-            "ndef file read should have returned 2 bytes"
-        );
+        ensure_length!(ndef_file_len_data.len(), 2);
+
         let ndef_file_len_bytes: [u8; 2] = ndef_file_len_data.try_into().unwrap();
         let ndef_file_len = u16::from_be_bytes(ndef_file_len_bytes);
         trace!(len = ndef_file_len, "got ndef file len");
@@ -368,16 +440,13 @@ impl<'a> NfcReader<'a> {
 
             offset += chunk_size as u16;
         }
-        eyre::ensure!(
-            ndef_file_data.len() == usize::from(ndef_file_len),
-            "ndef file should be reported length"
-        );
+        ensure_length!(ndef_file_data.len(), usize::from(ndef_file_len));
 
         Ok(ndef_file_data)
     }
 
     #[instrument(skip_all)]
-    fn update_file_ndef(&mut self, ndef_file_data: Vec<u8>) -> eyre::Result<()> {
+    fn update_file_ndef(&mut self, ndef_file_data: Vec<u8>) -> Result<(), NfcError> {
         trace!(
             "updating file with ndef data: {}",
             hex::encode(&ndef_file_data)
@@ -398,16 +467,7 @@ impl<'a> NfcReader<'a> {
     }
 
     #[instrument(skip_all)]
-    fn update_file(&mut self, offset: u16, data: &[u8]) -> eyre::Result<()> {
-        eyre::ensure!(
-            (0x0000..=0x7FFF).contains(&offset),
-            "offset range is 0000h-7FFFh"
-        );
-        eyre::ensure!(
-            (0x01..=0xFF).contains(&data.len()),
-            "data length range is 01h-FFh"
-        );
-
+    fn update_file(&mut self, offset: u16, data: &[u8]) -> Result<(), NfcError> {
         let mut update_file_req = vec![T4T_CLASS, T4T_INS_UPDATE];
         update_file_req.extend_from_slice(&offset.to_be_bytes());
         update_file_req.push(u8::try_from(data.len()).unwrap());
@@ -418,32 +478,23 @@ impl<'a> NfcReader<'a> {
             self.device
                 .initiator_transceive_bytes(&update_file_req, 2, nfc1::Timeout::Default)?;
         trace!("got update response: {}", hex::encode(&update_file_resp));
-        Self::check_status("update file", &update_file_resp)?;
+        Self::check_status(&update_file_resp)?;
 
         Ok(())
     }
 
     #[track_caller]
-    fn check_status(action: &'static str, data: &[u8]) -> eyre::Result<()> {
-        let status_bytes = &data[data.len() - 2..];
-        if status_bytes != [T4T_COMPLETED, 0x00] {
-            eyre::bail!(
-                "unexpected response from {action}: {}",
-                hex::encode(status_bytes)
-            );
-        }
+    fn check_status(data: &[u8]) -> Result<(), NfcError> {
+        ensure_bytes!([T4T_COMPLETED, 0x00], &data[data.len() - 2..]);
         Ok(())
     }
 
     #[instrument(skip_all, fields(tlv_data))]
-    fn get_ndef_file_id_from_cc(cc_data: &[u8]) -> eyre::Result<u16> {
+    fn get_ndef_file_id_from_cc(cc_data: &[u8]) -> Result<u16, NfcError> {
         let ndef_file_control_tlv = &cc_data[7..15];
         tracing::Span::current().record("tlv_data", hex::encode(ndef_file_control_tlv));
         trace!("got ndef file control tlv");
-        eyre::ensure!(
-            ndef_file_control_tlv[..2] == [0x04, 0x06],
-            "unknown tlv header"
-        );
+        ensure_bytes!([0x04, 0x06], ndef_file_control_tlv[..2]);
 
         // 2 bytes should always fit into a u16
         let ndef_file_id_bytes: [u8; 2] = ndef_file_control_tlv[2..4].try_into().unwrap();

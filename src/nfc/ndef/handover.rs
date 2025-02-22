@@ -1,9 +1,11 @@
-use eyre::OptionExt;
 use strum::FromRepr;
 use tracing::trace;
 use uuid::Uuid;
 
-use super::{IntoNdefRecord, RawNdefRecord, TypeNameFormat, encode_record, merge_messages};
+use crate::nfc::{
+    NfcError, ensure_length, get_byte,
+    ndef::{IntoNdefRecord, RawNdefRecord, TypeNameFormat, encode_record, merge_messages},
+};
 
 #[derive(Debug)]
 pub struct HandoverRequest {
@@ -58,9 +60,9 @@ pub struct HandoverSelect {
 }
 
 impl HandoverSelect {
-    pub fn decode(data: &[u8]) -> eyre::Result<Self> {
+    pub fn decode(data: &[u8]) -> Result<Self, NfcError> {
         let mut data = data.iter().copied();
-        let version = data.next().ok_or_eyre("missing version byte")?;
+        let version = get_byte!(data, "version");
 
         let record = RawNdefRecord::decode_single(&mut data)?;
 
@@ -68,35 +70,31 @@ impl HandoverSelect {
 
         let mut alternative_carriers = Vec::new();
 
-        let carrier_power_state_byte =
-            data.next().ok_or_eyre("missing carrier_power_state byte")?;
+        let carrier_power_state_byte = get_byte!(data, "carrier_power_state");
+
         let carrier_power_state =
             CarrierPowerState::from_repr(carrier_power_state_byte & 0b0000011)
-                .ok_or_eyre("carrier_power_state byte must be known")?;
+                .ok_or(NfcError::UnknownData)?;
         trace!(?carrier_power_state);
 
-        let carrier_data_ref_len = data.next().ok_or_eyre("missing carrier_ref_len byte")?;
-        trace!(carrier_data_ref_len);
+        let carrier_data_ref_len = get_byte!(data, "carrier_ref_len");
         let carrier_data_reference: Vec<_> =
             data.by_ref().take(carrier_data_ref_len as usize).collect();
-        eyre::ensure!(
-            carrier_data_reference.len() == usize::from(carrier_data_ref_len),
-            "not enough bytes to fill carrier_data_ref"
+        ensure_length!(
+            carrier_data_reference.len(),
+            usize::from(carrier_data_ref_len)
         );
         trace!(carrier_data_reference = hex::encode(&carrier_data_reference));
 
-        let aux_data_ref_count = data.next().ok_or_eyre("missing aux_data_ref_count byte")?;
+        let aux_data_ref_count = get_byte!(data, "aux_data_ref_count");
         trace!(aux_data_ref_count);
         let mut auxiliary_data_references: Vec<_> = Vec::with_capacity(aux_data_ref_count.into());
 
         for _ in 0..aux_data_ref_count {
-            let aux_data_ref_len = data.next().ok_or_eyre("missing aux_data_ref_len byte")?;
+            let aux_data_ref_len = get_byte!(data, "aux_data_ref_len");
             trace!(aux_data_ref_len);
             let aux_data_ref: Vec<_> = data.by_ref().take(aux_data_ref_len.into()).collect();
-            eyre::ensure!(
-                aux_data_ref.len() == usize::from(aux_data_ref_len),
-                "not enough bytes to fill aux_data_ref"
-            );
+            ensure_length!(aux_data_ref.len(), usize::from(aux_data_ref_len));
             trace!(aux_data_ref = hex::encode(&aux_data_ref));
             auxiliary_data_references.push(aux_data_ref);
         }
@@ -198,13 +196,13 @@ impl BLECarrierConfiguration {
         }
     }
 
-    pub fn decode(data: &[u8]) -> eyre::Result<Self> {
+    pub fn decode(data: &[u8]) -> Result<Self, NfcError> {
         let mut data = data.iter().copied();
 
         let mut data_type_blocks = Vec::new();
 
         while let Some(data_length) = data.next() {
-            let data_type = data.next().ok_or_eyre("missing data_type byte")?;
+            let data_type = get_byte!(data, "data_type");
             // data length includes the length of the type byte
             let block_data: Vec<_> = data.by_ref().take(data_length as usize - 1).collect();
             trace!(
@@ -212,10 +210,7 @@ impl BLECarrierConfiguration {
                 data_type = hex::encode(data_type.to_be_bytes()),
                 block_data = hex::encode(&block_data)
             );
-            eyre::ensure!(
-                block_data.len() == data_length as usize - 1,
-                "missing bytes from block_dtaa"
-            );
+            ensure_length!(block_data.len(), usize::from(data_length) - 1);
             data_type_blocks.push((data_type, block_data));
         }
 
@@ -387,7 +382,7 @@ mod tests {
         assert_eq!(config.le_role(), Some(BLERole::Peripheral));
         assert_eq!(
             config.service_uuid(),
-            Some(uuid::uuid!("ca451901-8d1e-88fc-9e43-4ea5a511b834"))
+            Some(uuid::uuid!("34b811a5-a54e-439e-88fc-8d1eca451901"))
         );
     }
 }

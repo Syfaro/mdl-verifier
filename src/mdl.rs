@@ -13,13 +13,13 @@ impl Default for ReaderEngagement {
 }
 
 impl ReaderEngagement {
-    pub fn encode(self) -> eyre::Result<Vec<u8>> {
+    pub fn encode(self) -> Result<Vec<u8>, ciborium::value::Error> {
         let val = ciborium::cbor!({
             0 => self.version,
         })?;
 
         let mut data = Vec::new();
-        ciborium::into_writer(&val, &mut data)?;
+        ciborium::into_writer(&val, &mut data).unwrap();
         Ok(data)
     }
 }

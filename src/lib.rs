@@ -4,11 +4,15 @@ use futures::Stream;
 use isomdl::{
     definitions::{
         BleOptions, DeviceEngagement,
-        helpers::{ByteStr, Tag24},
+        device_request::{DataElements, Namespaces},
+        helpers::{ByteStr, Tag24, tag24},
         session::Handover,
+        x509::trust_anchor::{PemTrustAnchor, TrustAnchorRegistry, TrustPurpose},
     },
     presentation::authentication::ResponseAuthenticationOutcome,
 };
+use thiserror::Error;
+use tokio::sync::mpsc::Receiver;
 use tokio_stream::{StreamExt, StreamMap};
 use uuid::Uuid;
 
@@ -21,19 +25,40 @@ pub struct Config {
     pub nfc_connstring: Option<String>,
 }
 
-#[derive(Debug)]
-pub enum VerifierEvent {
-    Error(eyre::Report),
-    Verified(ResponseAuthenticationOutcome),
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error(transparent)]
+    BleError(#[from] ble::BleError),
+    #[error(transparent)]
+    NfcError(#[from] nfc::NfcError),
+    #[error(transparent)]
+    VerifyError(#[from] VerifyError),
 }
 
-type StreamConnectionInfo = eyre::Result<(Uuid, Tag24<DeviceEngagement>, Handover)>;
+#[derive(Error, Debug)]
+pub enum VerifyError {
+    #[error("failed to build trust anchors")]
+    TrustAnchor(Box<dyn std::error::Error + Send + Sync>),
+    #[error(transparent)]
+    DeviceEngagement(tag24::Error),
+    #[error("failed to parse qr code engagement")]
+    DeviceEngagementQr(Box<dyn std::error::Error + Send + Sync>),
+    #[error("missing required connection mode: {0}")]
+    MissingMode(&'static str),
+    #[error("failed to establish session")]
+    EstablishSession(Box<dyn std::error::Error + Send + Sync>),
+}
+
+#[derive(Debug)]
+pub enum VerifierEvent {
+    Error(Error),
+    AuthenticationOutcome(ResponseAuthenticationOutcome),
+}
+
+type StreamConnectionInfo = Result<(Uuid, Tag24<DeviceEngagement>, Handover), Error>;
 type PinnedStreamResult = Pin<Box<dyn Stream<Item = StreamConnectionInfo> + Send + Sync>>;
 
-pub async fn start<S>(
-    config: Config,
-    scanner_stream: S,
-) -> eyre::Result<tokio::sync::mpsc::Receiver<VerifierEvent>>
+pub async fn start<S>(config: Config, scanner_stream: S) -> Result<Receiver<VerifierEvent>, Error>
 where
     S: Stream<Item = String> + Unpin + Send + Sync + 'static,
 {
@@ -53,17 +78,36 @@ where
 
     let stream = streams.map(|(_, res)| res);
 
-    let rx = ble::attempt_connections(config.certificate_pem_data, stream).await?;
+    let certs: Vec<_> = config
+        .certificate_pem_data
+        .into_iter()
+        .map(|cert| PemTrustAnchor {
+            purpose: TrustPurpose::Iaca,
+            certificate_pem: cert,
+        })
+        .collect();
+
+    let trust_anchors = TrustAnchorRegistry::from_pem_certificates(certs).map_err(|err| {
+        VerifyError::TrustAnchor(Box::<dyn std::error::Error + Send + Sync + 'static>::from(
+            err,
+        ))
+    })?;
+
+    let requested_elements = Namespaces::new(
+        "org.iso.18013.5.1".into(),
+        DataElements::new("age_over_21".to_string(), false),
+    );
+
+    let rx = ble::attempt_connections(trust_anchors, requested_elements, stream).await?;
 
     Ok(rx)
 }
 
-fn nfc_to_needed(
-    connection: nfc::NegotiatedConnection,
-) -> eyre::Result<(Uuid, Tag24<DeviceEngagement>, Handover)> {
+fn nfc_to_needed(connection: nfc::NegotiatedConnection) -> StreamConnectionInfo {
     Ok((
         connection.service_uuid,
-        Tag24::<DeviceEngagement>::from_bytes(connection.device_engagement)?,
+        Tag24::<DeviceEngagement>::from_bytes(connection.device_engagement)
+            .map_err(VerifyError::DeviceEngagement)?,
         Handover::NFC(
             ByteStr::from(connection.handover_select),
             connection.handover_request.map(ByteStr::from),
@@ -71,9 +115,13 @@ fn nfc_to_needed(
     ))
 }
 
-fn qr_to_needed(engagement: String) -> eyre::Result<(Uuid, Tag24<DeviceEngagement>, Handover)> {
-    let device_engagement = Tag24::<DeviceEngagement>::from_qr_code_uri(&engagement)
-        .map_err(|err| eyre::eyre!(Box::new(err)))?;
+fn qr_to_needed(engagement: String) -> StreamConnectionInfo {
+    let device_engagement =
+        Tag24::<DeviceEngagement>::from_qr_code_uri(&engagement).map_err(|err| {
+            VerifyError::DeviceEngagementQr(
+                Box::<dyn std::error::Error + Send + Sync + 'static>::from(err),
+            )
+        })?;
 
     let Some(server_mode) = device_engagement
         .clone()
@@ -89,7 +137,7 @@ fn qr_to_needed(engagement: String) -> eyre::Result<(Uuid, Tag24<DeviceEngagemen
             })
         })
     else {
-        eyre::bail!("could not find BLE peripheral server mode");
+        return Err(VerifyError::MissingMode("ble peripheral server").into());
     };
 
     Ok((server_mode.uuid, device_engagement, Handover::QR))

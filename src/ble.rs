@@ -4,17 +4,17 @@ use btleplug::{
     api::{Central as _, CentralEvent, Manager as _, Peripheral as _, ScanFilter},
     platform::{Adapter, Manager},
 };
-use eyre::OptionExt;
 use isomdl::{
     definitions::{
         DeviceEngagement,
-        device_request::{DataElements, Namespaces},
         helpers::{NonEmptyMap, Tag24},
         session::Handover,
-        x509::trust_anchor::{PemTrustAnchor, TrustAnchorRegistry, TrustPurpose},
+        x509::trust_anchor::TrustAnchorRegistry,
     },
     presentation::{authentication::ResponseAuthenticationOutcome, reader::SessionManager},
 };
+use thiserror::Error;
+use tokio::sync::mpsc::{Receiver, channel};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, trace, warn};
 use uuid::{Uuid, uuid};
@@ -26,40 +26,46 @@ const SERVER2CLIENT_ID: Uuid = uuid!("00000003-A123-48CE-896B-4C76973373E6");
 /// Maximum length of data to read from a peripheral before aborting.
 const MAX_PAYLOAD_SIZE: usize = 512 * 1000;
 
+#[derive(Error, Debug)]
+pub enum BleError {
+    #[error(transparent)]
+    BtleplugError(#[from] btleplug::Error),
+    #[error("no ble adapter found")]
+    NoAdapter,
+    #[error("peripheral with service {0} was not found")]
+    MissingPeripheral(Uuid),
+    #[error("peripheral was missing characteristic {0}")]
+    MissingCharacteristic(Uuid),
+    #[error("received data exceeded maximum allowable size")]
+    DataTooLarge,
+    #[error("received data was empty")]
+    DataEmpty,
+}
+
+macro_rules! find_characteristic {
+    ($characteristics:expr, $characteristic:expr) => {
+        match $characteristics.iter().find(|c| c.uuid == $characteristic) {
+            Some(ch) => ch,
+            None => return Err(BleError::MissingCharacteristic($characteristic).into()),
+        }
+    };
+}
+
 pub async fn attempt_connections<S>(
-    certificates: Vec<String>,
+    trust_anchors: TrustAnchorRegistry,
+    requested_elements: NonEmptyMap<String, NonEmptyMap<String, bool>>,
     mut stream: S,
-) -> eyre::Result<tokio::sync::mpsc::Receiver<super::VerifierEvent>>
+) -> Result<Receiver<super::VerifierEvent>, BleError>
 where
-    S: futures::Stream<Item = eyre::Result<(Uuid, Tag24<DeviceEngagement>, Handover)>>
-        + Unpin
-        + Send
-        + Sync
-        + 'static,
+    S: futures::Stream<Item = super::StreamConnectionInfo> + Unpin + Send + Sync + 'static,
 {
     let manager = Manager::new().await?;
     let mut adapters = manager.adapters().await?;
-    let central = adapters.pop().ok_or_eyre("missing ble adapter")?;
+    let central = adapters.pop().ok_or(BleError::NoAdapter)?;
 
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-
-    let certs: Vec<_> = certificates
-        .into_iter()
-        .map(|cert| PemTrustAnchor {
-            purpose: TrustPurpose::Iaca,
-            certificate_pem: cert,
-        })
-        .collect();
-
-    let trust_anchors = TrustAnchorRegistry::from_pem_certificates(certs)
-        .map_err(|err| eyre::eyre!(Box::new(err)))?;
+    let (tx, rx) = channel(1);
 
     tokio::spawn(async move {
-        let requested_elements = Namespaces::new(
-            "org.iso.18013.5.1".into(),
-            DataElements::new("age_over_21".to_string(), false),
-        );
-
         while let Ok(Some((service_uuid, device_engagement, handover))) = stream.try_next().await {
             match tokio::time::timeout(
                 Duration::from_secs(30),
@@ -75,7 +81,7 @@ where
             .await
             {
                 Ok(Ok(outcome)) => tx
-                    .send(crate::VerifierEvent::Verified(outcome))
+                    .send(crate::VerifierEvent::AuthenticationOutcome(outcome))
                     .await
                     .unwrap(),
                 Ok(Err(err)) => error!("error getting authentication outcome: {err}"),
@@ -94,7 +100,7 @@ async fn attempt_exchange(
     service_uuid: Uuid,
     device_engagement: Tag24<DeviceEngagement>,
     handover: Handover,
-) -> eyre::Result<ResponseAuthenticationOutcome> {
+) -> Result<ResponseAuthenticationOutcome, super::Error> {
     trace!("got device_engagement: {device_engagement:?}");
 
     let (mut reader_sm, session_request, _ble_ident) =
@@ -104,15 +110,17 @@ async fn attempt_exchange(
             trust_anchors,
             handover,
         )
-        .map_err(|err| eyre::eyre!(Box::new(err)))?;
+        .map_err(Box::<dyn std::error::Error + Send + Sync + 'static>::from)
+        .map_err(super::VerifyError::EstablishSession)?;
 
-    let mut events = central.events().await?;
+    let mut events = central.events().await.map_err(BleError::BtleplugError)?;
 
     central
         .start_scan(ScanFilter {
             services: vec![service_uuid],
         })
-        .await?;
+        .await
+        .map_err(BleError::BtleplugError)?;
     debug!(service_uuid = %service_uuid, "starting scan for service");
 
     let peripheral_id = loop {
@@ -125,16 +133,25 @@ async fn attempt_exchange(
                 trace!("got other ble event: {event:?}");
             }
             None => {
-                eyre::bail!("end of events without discovering device");
+                return Err(BleError::MissingPeripheral(service_uuid).into());
             }
         }
     };
 
-    central.stop_scan().await?;
+    central.stop_scan().await.map_err(BleError::BtleplugError)?;
 
-    let peripheral = central.peripheral(&peripheral_id).await?;
-    peripheral.connect().await?;
-    peripheral.discover_services().await?;
+    let peripheral = central
+        .peripheral(&peripheral_id)
+        .await
+        .map_err(BleError::BtleplugError)?;
+    peripheral
+        .connect()
+        .await
+        .map_err(BleError::BtleplugError)?;
+    peripheral
+        .discover_services()
+        .await
+        .map_err(BleError::BtleplugError)?;
     trace!("discovered services");
 
     let characteristics: Vec<_> = peripheral
@@ -143,25 +160,24 @@ async fn attempt_exchange(
         .filter(|c| c.service_uuid == service_uuid)
         .collect();
 
-    let Some(state) = characteristics.iter().find(|c| c.uuid == STATE_ID) else {
-        eyre::bail!("missing state characteristic");
-    };
+    let state = find_characteristic!(characteristics, STATE_ID);
+    let client2server = find_characteristic!(characteristics, CLIENT2SERVER_ID);
+    let server2client = find_characteristic!(characteristics, SERVER2CLIENT_ID);
 
-    let Some(client2server) = characteristics.iter().find(|c| c.uuid == CLIENT2SERVER_ID) else {
-        eyre::bail!("missing c2s characteristic");
-    };
-
-    let Some(server2client) = characteristics.iter().find(|c| c.uuid == SERVER2CLIENT_ID) else {
-        eyre::bail!("missing s2c characteristic");
-    };
-
-    peripheral.subscribe(state).await?;
-    peripheral.subscribe(server2client).await?;
+    peripheral
+        .subscribe(state)
+        .await
+        .map_err(BleError::BtleplugError)?;
+    peripheral
+        .subscribe(server2client)
+        .await
+        .map_err(BleError::BtleplugError)?;
     trace!("subscribed to characteristics");
 
     peripheral
         .write(state, &[0x01], btleplug::api::WriteType::WithoutResponse)
-        .await?;
+        .await
+        .map_err(BleError::BtleplugError)?;
     trace!("wrote start");
 
     // TODO: figure out the real MTU, but for now our requests are small
@@ -194,23 +210,27 @@ async fn attempt_exchange(
                 &buf,
                 btleplug::api::WriteType::WithoutResponse,
             )
-            .await?;
+            .await
+            .map_err(BleError::BtleplugError)?;
 
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    let mut notifs = peripheral.notifications().await?;
+    let mut notifs = peripheral
+        .notifications()
+        .await
+        .map_err(BleError::BtleplugError)?;
     trace!("starting peripheral notifications");
 
     let mut response: Vec<u8> = Vec::new();
 
     while let Some(data) = notifs.next().await {
         if response.len() + data.value.len() > MAX_PAYLOAD_SIZE {
-            eyre::bail!("response payload is too large");
+            return Err(BleError::DataTooLarge.into());
         }
 
         let Some(first) = data.value.first().copied() else {
-            eyre::bail!("value notification did not have any bytes");
+            return Err(BleError::DataEmpty.into());
         };
 
         if data.value.len() > 1 {
@@ -233,10 +253,14 @@ async fn attempt_exchange(
 
     peripheral
         .write(state, &[0x02], btleplug::api::WriteType::WithoutResponse)
-        .await?;
+        .await
+        .map_err(BleError::BtleplugError)?;
     trace!("wrote end");
 
-    peripheral.disconnect().await?;
+    peripheral
+        .disconnect()
+        .await
+        .map_err(BleError::BtleplugError)?;
     trace!("disconnected from peripheral");
 
     let validated = reader_sm.handle_response(&response);

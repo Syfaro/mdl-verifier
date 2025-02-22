@@ -1,6 +1,7 @@
-use eyre::OptionExt;
-
-use super::{IntoNdefRecord, TypeNameFormat, encode_record};
+use crate::nfc::{
+    NfcError, ensure_length, get_byte, get_bytes,
+    ndef::{IntoNdefRecord, TypeNameFormat, encode_record},
+};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -14,35 +15,22 @@ pub struct ServiceParameter {
 }
 
 impl ServiceParameter {
-    pub fn decode(data: &[u8]) -> eyre::Result<Self> {
+    pub fn decode(data: &[u8]) -> Result<Self, NfcError> {
         let mut data = data.iter().copied();
 
-        let version = data.next().ok_or_eyre("missing version byte")?;
+        let version = get_byte!(data, "version");
 
-        let service_name_len = data.next().ok_or_eyre("missing service_name_len byte")?;
+        let service_name_len = get_byte!(data, "service_name_len");
         let service_name: Vec<u8> = data.by_ref().take(service_name_len.into()).collect();
-        eyre::ensure!(
-            service_name.len() == usize::from(service_name_len),
-            "not enough bytes to fill service_name"
-        );
-        let service_name = String::from_utf8(service_name)?;
+        ensure_length!(service_name.len(), usize::from(service_name_len));
+        let service_name = String::from_utf8_lossy(&service_name).to_string();
 
-        let tnep_communication_mode = data
-            .next()
-            .ok_or_eyre("missing tnep_communication_mode byte")?;
-        let minimum_waiting_time = data
-            .next()
-            .ok_or_eyre("missing minimum_waiting_time byte")?;
-        let maximum_waiting_time_extensions = data
-            .next()
-            .ok_or_eyre("missing maximum_waiting_time_extensions byte")?;
+        let tnep_communication_mode = get_byte!(data, "tnep_communication_mode");
+        let minimum_waiting_time = get_byte!(data, "minimum_waiting_time");
+        let maximum_waiting_time_extensions = get_byte!(data, "maximum_waiting_time_extensions");
 
-        let maximum_message_size_bytes: [u8; 2] = data
-            .take(2)
-            .collect::<Vec<_>>()
-            .try_into()
-            .map_err(|_| eyre::eyre!("not enough bytes to fill maximum_message_size_bytes"))?;
-        let maximum_message_size = u16::from_be_bytes(maximum_message_size_bytes);
+        let maximum_message_size =
+            u16::from_be_bytes(get_bytes!(data, 2, "maximum_message_size_bytes"));
 
         Ok(ServiceParameter {
             version,
@@ -80,23 +68,34 @@ impl IntoNdefRecord for ServiceSelect {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub enum Status {
     Success,
-    Unknown,
+    Unknown(u8),
 }
 
 impl Status {
-    pub fn from_repr(repr: u8) -> eyre::Result<Self> {
+    pub fn from_repr(repr: u8) -> Result<Self, NfcError> {
         match repr {
             0x00 => Ok(Self::Success),
-            other => eyre::bail!("unknown status code: {other:02x}"),
+            other => Err(NfcError::UnexpectedBytes {
+                expected: vec![0x00],
+                got: vec![other],
+            }),
         }
     }
 
-    pub fn decode(data: &[u8]) -> eyre::Result<Self> {
-        eyre::ensure!(data.len() == 1, "status should only have one byte");
+    pub fn decode(data: &[u8]) -> Result<Self, NfcError> {
+        ensure_length!(data.len(), 1);
         Self::from_repr(data[0])
+    }
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success => write!(f, "tnep success"),
+            Self::Unknown(val) => write!(f, "tnep unknown: {val:02x}"),
+        }
     }
 }
