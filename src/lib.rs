@@ -1,29 +1,22 @@
-use std::pin::Pin;
+use std::{collections::HashMap, pin::Pin};
 
 use futures::Stream;
 use isomdl::{
     definitions::{
         BleOptions, DeviceEngagement,
-        device_request::{DataElements, Namespaces},
-        helpers::{ByteStr, Tag24, tag24},
-        session::Handover,
+        helpers::{NonEmptyMap, Tag24, tag24},
         x509::trust_anchor::{PemTrustAnchor, TrustAnchorRegistry, TrustPurpose},
     },
     presentation::authentication::ResponseAuthenticationOutcome,
 };
 use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
-use tokio_stream::{StreamExt, StreamMap};
+use tokio_stream::{StreamExt, StreamMap, wrappers::ReceiverStream};
 use uuid::Uuid;
 
 mod ble;
 mod mdl;
 mod nfc;
-
-pub struct Config {
-    pub certificate_pem_data: Vec<String>,
-    pub nfc_connstring: Option<String>,
-}
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -33,6 +26,8 @@ pub enum Error {
     NfcError(#[from] nfc::NfcError),
     #[error(transparent)]
     VerifyError(#[from] VerifyError),
+    #[error("invalid config: {0}")]
+    InvalidConfig(&'static str),
 }
 
 #[derive(Error, Debug)]
@@ -55,90 +50,212 @@ pub enum VerifierEvent {
     AuthenticationOutcome(ResponseAuthenticationOutcome),
 }
 
-type StreamConnectionInfo = Result<(Uuid, Tag24<DeviceEngagement>, Handover), Error>;
-type PinnedStreamResult = Pin<Box<dyn Stream<Item = StreamConnectionInfo> + Send + Sync>>;
+#[derive(Clone, Debug)]
+pub struct StreamConnectionInfo {
+    pub ble_service_mode: BLEServiceMode,
+    pub ble_service_uuid: Uuid,
+    pub device_engagement_bytes: Tag24<DeviceEngagement>,
+    pub handover_type: HandoverType,
+}
 
-pub async fn start<S>(config: Config, scanner_stream: S) -> Result<Receiver<VerifierEvent>, Error>
-where
-    S: Stream<Item = String> + Unpin + Send + Sync + 'static,
-{
-    let mut streams = StreamMap::new();
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BLEServiceMode {
+    PeripheralServer,
+    CentralClient,
+}
 
-    streams.insert(
-        "qr",
-        Box::pin(scanner_stream.map(qr_to_needed)) as PinnedStreamResult,
-    );
+impl From<nfc::ndef::handover::BLERole> for BLEServiceMode {
+    fn from(value: nfc::ndef::handover::BLERole) -> Self {
+        use nfc::ndef::handover::BLERole::{
+            Central, CentralPeripheral, Peripheral, PeripheralCentral,
+        };
 
-    if let Some(connstring) = config.nfc_connstring {
-        let nfc_rx = nfc::start_nfc_thread(connstring)?;
-        let nfc_stream = tokio_stream::wrappers::ReceiverStream::new(nfc_rx).map(nfc_to_needed);
+        match value {
+            Peripheral | PeripheralCentral => Self::PeripheralServer,
+            Central | CentralPeripheral => Self::CentralClient,
+        }
+    }
+}
 
-        streams.insert("nfc", Box::pin(nfc_stream) as PinnedStreamResult);
+#[derive(Clone, Debug)]
+pub enum HandoverType {
+    Qr,
+    Nfc {
+        handover_select_bytes: Vec<u8>,
+        handover_request_bytes: Option<Vec<u8>>,
+    },
+}
+
+impl From<HandoverType> for isomdl::definitions::session::Handover {
+    fn from(value: HandoverType) -> Self {
+        match value {
+            HandoverType::Qr => isomdl::definitions::session::Handover::QR,
+            HandoverType::Nfc {
+                handover_select_bytes,
+                handover_request_bytes,
+            } => isomdl::definitions::session::Handover::NFC(
+                isomdl::definitions::helpers::ByteStr::from(handover_select_bytes),
+                handover_request_bytes.map(isomdl::definitions::helpers::ByteStr::from),
+            ),
+        }
+    }
+}
+
+type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub type PinnedConnectionInfoStream =
+    Pin<Box<dyn Stream<Item = Result<StreamConnectionInfo, BoxedError>> + Send + Sync>>;
+
+pub struct MdlVerifier {
+    trust_anchors: TrustAnchorRegistry,
+    requested_elements: NonEmptyMap<String, NonEmptyMap<String, bool>>,
+    streams: StreamMap<String, PinnedConnectionInfoStream>,
+}
+
+impl MdlVerifier {
+    pub fn new(
+        certificate_pem_data: Vec<String>,
+        requested_elements: HashMap<String, HashMap<String, bool>>,
+    ) -> Result<Self, Error> {
+        let requested_elements = Self::non_empty_requested_elements(requested_elements)
+            .ok_or(Error::InvalidConfig("must have requested elements"))?;
+
+        let certs: Vec<_> = certificate_pem_data
+            .into_iter()
+            .map(|cert| PemTrustAnchor {
+                purpose: TrustPurpose::Iaca,
+                certificate_pem: cert,
+            })
+            .collect();
+
+        let trust_anchors = TrustAnchorRegistry::from_pem_certificates(certs).map_err(|err| {
+            VerifyError::TrustAnchor(Box::<dyn std::error::Error + Send + Sync + 'static>::from(
+                err,
+            ))
+        })?;
+
+        Ok(Self {
+            trust_anchors,
+            requested_elements,
+            streams: Default::default(),
+        })
     }
 
-    let stream = streams.map(|(_, res)| res);
+    pub fn add_qr_stream<S>(&mut self, stream: S) -> &mut Self
+    where
+        S: Stream<Item = String> + Unpin + Send + Sync + 'static,
+    {
+        self.add_stream(
+            "qr",
+            Box::pin(stream.map(qr_to_needed)) as PinnedConnectionInfoStream,
+        );
 
-    let certs: Vec<_> = config
-        .certificate_pem_data
-        .into_iter()
-        .map(|cert| PemTrustAnchor {
-            purpose: TrustPurpose::Iaca,
-            certificate_pem: cert,
-        })
-        .collect();
+        self
+    }
 
-    let trust_anchors = TrustAnchorRegistry::from_pem_certificates(certs).map_err(|err| {
-        VerifyError::TrustAnchor(Box::<dyn std::error::Error + Send + Sync + 'static>::from(
-            err,
-        ))
-    })?;
+    pub fn add_nfc_stream(&mut self, connstring: String) -> Result<&mut Self, Error> {
+        let nfc_rx = nfc::start_nfc_thread(connstring)?;
+        let nfc_stream = ReceiverStream::new(nfc_rx).map(nfc_to_needed);
 
-    let requested_elements = Namespaces::new(
-        "org.iso.18013.5.1".into(),
-        DataElements::new("age_over_21".to_string(), false),
-    );
+        self.add_stream("nfc", Box::pin(nfc_stream) as PinnedConnectionInfoStream);
 
-    let rx = ble::attempt_connections(trust_anchors, requested_elements, stream).await?;
+        Ok(self)
+    }
 
-    Ok(rx)
+    pub fn add_stream<S>(&mut self, name: impl ToString, stream: S) -> &mut Self
+    where
+        S: Into<PinnedConnectionInfoStream>,
+    {
+        self.streams.insert(name.to_string(), stream.into());
+        self
+    }
+
+    pub async fn start(self) -> Result<Receiver<VerifierEvent>, Error> {
+        if self.streams.is_empty() {
+            return Err(Error::InvalidConfig(
+                "at least one stream must be specified",
+            ));
+        }
+
+        let stream = self.streams.map(|(_name, res)| res);
+
+        ble::attempt_connections(self.trust_anchors, self.requested_elements, stream)
+            .await
+            .map_err(Into::into)
+    }
+
+    fn non_empty_requested_elements(
+        requested_elements: HashMap<String, HashMap<String, bool>>,
+    ) -> Option<NonEmptyMap<String, NonEmptyMap<String, bool>>> {
+        NonEmptyMap::maybe_new(
+            requested_elements
+                .into_iter()
+                .filter_map(|(namespace, elements)| {
+                    NonEmptyMap::maybe_new(elements.into_iter().collect())
+                        .map(|map| (namespace, map))
+                })
+                .collect(),
+        )
+    }
 }
 
-fn nfc_to_needed(connection: nfc::NegotiatedConnection) -> StreamConnectionInfo {
-    Ok((
-        connection.service_uuid,
+fn nfc_to_needed(
+    connection: nfc::NegotiatedConnection,
+) -> Result<StreamConnectionInfo, BoxedError> {
+    let device_engagement_bytes =
         Tag24::<DeviceEngagement>::from_bytes(connection.device_engagement)
-            .map_err(VerifyError::DeviceEngagement)?,
-        Handover::NFC(
-            ByteStr::from(connection.handover_select),
-            connection.handover_request.map(ByteStr::from),
-        ),
-    ))
+            .map_err(VerifyError::DeviceEngagement)?;
+
+    Ok(StreamConnectionInfo {
+        ble_service_mode: connection.le_role.into(),
+        ble_service_uuid: connection.service_uuid,
+        device_engagement_bytes,
+        handover_type: HandoverType::Nfc {
+            handover_select_bytes: connection.handover_select,
+            handover_request_bytes: connection.handover_request,
+        },
+    })
 }
 
-fn qr_to_needed(engagement: String) -> StreamConnectionInfo {
-    let device_engagement =
-        Tag24::<DeviceEngagement>::from_qr_code_uri(&engagement).map_err(|err| {
+fn qr_to_needed(engagement: String) -> Result<StreamConnectionInfo, BoxedError> {
+    let device_engagement_bytes = Tag24::<DeviceEngagement>::from_qr_code_uri(&engagement)
+        .map_err(|err| {
             VerifyError::DeviceEngagementQr(
                 Box::<dyn std::error::Error + Send + Sync + 'static>::from(err),
             )
         })?;
 
-    let Some(server_mode) = device_engagement
+    let Some((ble_service_mode, ble_service_uuid)) = device_engagement_bytes
         .clone()
         .into_inner()
         .device_retrieval_methods
-        .and_then(|methods| {
-            methods.iter().find_map(|method| match method {
-                isomdl::definitions::DeviceRetrievalMethod::BLE(BleOptions {
-                    peripheral_server_mode: Some(server_mode),
-                    ..
-                }) => Some(server_mode.clone()),
-                _ => None,
-            })
+        .into_iter()
+        .flat_map(|methods| methods.into_inner())
+        .filter_map(|method| match method {
+            isomdl::definitions::DeviceRetrievalMethod::BLE(ble) => Some(ble),
+            _ => None,
+        })
+        .find_map(|ble| match ble {
+            BleOptions {
+                peripheral_server_mode: Some(peripheral_server_mode),
+                ..
+            } => Some((
+                BLEServiceMode::PeripheralServer,
+                peripheral_server_mode.uuid,
+            )),
+            BleOptions {
+                central_client_mode: Some(central_client_mode),
+                ..
+            } => Some((BLEServiceMode::CentralClient, central_client_mode.uuid)),
+            _ => None,
         })
     else {
-        return Err(VerifyError::MissingMode("ble peripheral server").into());
+        return Err(VerifyError::MissingMode("ble").into());
     };
 
-    Ok((server_mode.uuid, device_engagement, Handover::QR))
+    Ok(StreamConnectionInfo {
+        ble_service_mode,
+        ble_service_uuid,
+        device_engagement_bytes,
+        handover_type: HandoverType::Qr,
+    })
 }

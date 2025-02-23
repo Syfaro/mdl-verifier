@@ -57,7 +57,11 @@ pub async fn attempt_connections<S>(
     mut stream: S,
 ) -> Result<Receiver<super::VerifierEvent>, BleError>
 where
-    S: futures::Stream<Item = super::StreamConnectionInfo> + Unpin + Send + Sync + 'static,
+    S: futures::Stream<Item = Result<super::StreamConnectionInfo, super::BoxedError>>
+        + Unpin
+        + Send
+        + Sync
+        + 'static,
 {
     let manager = Manager::new().await?;
     let mut adapters = manager.adapters().await?;
@@ -66,16 +70,16 @@ where
     let (tx, rx) = channel(1);
 
     tokio::spawn(async move {
-        while let Ok(Some((service_uuid, device_engagement, handover))) = stream.try_next().await {
+        while let Ok(Some(conn_info)) = stream.try_next().await {
             match tokio::time::timeout(
                 Duration::from_secs(30),
                 attempt_exchange(
                     &central,
                     requested_elements.clone(),
                     trust_anchors.clone(),
-                    service_uuid,
-                    device_engagement,
-                    handover,
+                    conn_info.ble_service_uuid,
+                    conn_info.device_engagement_bytes,
+                    conn_info.handover_type.into(),
                 ),
             )
             .await
@@ -101,8 +105,6 @@ async fn attempt_exchange(
     device_engagement: Tag24<DeviceEngagement>,
     handover: Handover,
 ) -> Result<ResponseAuthenticationOutcome, super::Error> {
-    trace!("got device_engagement: {device_engagement:?}");
-
     let (mut reader_sm, session_request, _ble_ident) =
         SessionManager::establish_session_with_handover(
             device_engagement,

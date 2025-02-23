@@ -25,7 +25,7 @@ struct Config {
     nfc_connstring: Option<String>,
 
     #[clap(short = 's', long, env)]
-    scanner_path: String,
+    scanner_path: Option<String>,
     #[clap(short = 'b', long, env, default_value = "115200")]
     scanner_baud: u32,
 }
@@ -43,16 +43,26 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let scanner_stream = create_scanner_stream(config.scanner_path, config.scanner_baud).await?;
+    let mut verifier = mdl_verifier::MdlVerifier::new(
+        load_certificates(config.certificates_path).await?,
+        [(
+            "org.iso.18013.5.1".to_string(),
+            [("age_over_21".to_string(), false)].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
+    )?;
 
-    let mut events = mdl_verifier::start(
-        mdl_verifier::Config {
-            certificate_pem_data: load_certificates(config.certificates_path).await?,
-            nfc_connstring: config.nfc_connstring,
-        },
-        scanner_stream,
-    )
-    .await?;
+    if let Some(scanner_path) = config.scanner_path {
+        let scanner_stream = create_scanner_stream(scanner_path, config.scanner_baud).await?;
+        verifier.add_qr_stream(scanner_stream);
+    }
+
+    if let Some(nfc_connstring) = config.nfc_connstring {
+        verifier.add_nfc_stream(nfc_connstring)?;
+    }
+
+    let mut events = verifier.start().await?;
 
     while let Some(event) = events.recv().await {
         info!("got event: {event:?}");
@@ -63,17 +73,21 @@ async fn main() -> anyhow::Result<()> {
 
 async fn load_certificates(path: PathBuf) -> anyhow::Result<Vec<String>> {
     let mut certificate_pem_data = Vec::new();
+
     let mut entries = tokio::fs::read_dir(path).await?;
     while let Ok(Some(file)) = entries.next_entry().await {
         if file.path().extension() != Some(OsStr::new("pem")) {
             continue;
         }
+
         debug!(path = %file.path().display(), "loading certificate");
         let mut file = tokio::fs::File::open(file.path()).await?;
+
         let mut data = String::new();
         file.read_to_string(&mut data).await?;
         certificate_pem_data.push(data);
     }
+
     Ok(certificate_pem_data)
 }
 
