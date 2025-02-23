@@ -28,6 +28,10 @@ pub enum Error {
     VerifyError(#[from] VerifyError),
     #[error("invalid config: {0}")]
     InvalidConfig(&'static str),
+    #[error("unexpected error: {0}")]
+    Unexpected(Box<dyn std::error::Error + Send + Sync>),
+    #[error("cancelled")]
+    Timeout,
 }
 
 #[derive(Error, Debug)]
@@ -46,8 +50,8 @@ pub enum VerifyError {
 
 #[derive(Debug)]
 pub enum VerifierEvent {
-    Error(Error),
     AuthenticationOutcome(ResponseAuthenticationOutcome),
+    Error(Error),
 }
 
 #[derive(Clone, Debug)]

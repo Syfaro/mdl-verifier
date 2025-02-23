@@ -6,6 +6,7 @@ license = "MIT"
 authors = ["Syfaro <syfaro@huefox.com>"]
 
 [dependencies]
+ble-peripheral-rust = "0.2.0"
 btleplug = "0.11.7"
 ciborium = "0.2.2"
 futures = "0.3.31"
@@ -17,6 +18,7 @@ strum = { version = "0.27.1", features = ["derive"] }
 thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 tokio-stream = "0.1.17"
+tokio-util = "0.7.13"
 tracing = "0.1.41"
 uuid = { version = "1.14.0", features = ["v4"] }
 

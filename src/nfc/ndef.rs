@@ -21,7 +21,6 @@ pub enum TypeNameFormat {
     Reserved,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum KnownNdefRecord {
     TnepServiceParameter(tnep::ServiceParameter),
@@ -68,7 +67,6 @@ impl KnownNdefRecord {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct RawNdefRecord {
     pub message_begin: bool,

@@ -7,7 +7,7 @@ Features:
 - [x] NFC Negotiated Handover Engagement
 - [x] QR Engagement
 - [x] BLE Peripheral Server Retrieval
-- [ ] BLE Central Client Retrieval
+- [x] BLE Central Client Retrieval
 - [x] Verification
 
 ## Running

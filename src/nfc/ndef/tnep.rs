@@ -3,7 +3,6 @@ use crate::nfc::{
     ndef::{IntoNdefRecord, TypeNameFormat, encode_record},
 };
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ServiceParameter {
     pub version: u8,

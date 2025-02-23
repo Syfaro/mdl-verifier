@@ -52,7 +52,6 @@ impl IntoNdefRecord for CollisionResolution {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct HandoverSelect {
     pub version: u8,
@@ -146,7 +145,6 @@ pub enum CarrierPowerState {
     Unknown = 0x03,
 }
 
-#[allow(dead_code)]
 #[derive(FromRepr, Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum BLERole {
@@ -239,14 +237,12 @@ impl BLECarrierConfiguration {
         buf
     }
 
-    #[allow(dead_code)]
     pub fn get_by_type(&self, wanted_type: u8) -> Option<&[u8]> {
         self.data.iter().find_map(|(data_type, data_value)| {
             (*data_type == wanted_type).then_some(data_value.as_slice())
         })
     }
 
-    #[allow(dead_code)]
     pub fn le_role(&self) -> Option<BLERole> {
         self.get_by_type(0x1C)
             .and_then(|data| data.first())
@@ -254,7 +250,6 @@ impl BLECarrierConfiguration {
             .and_then(BLERole::from_repr)
     }
 
-    #[allow(dead_code)]
     pub fn service_uuid(&self) -> Option<Uuid> {
         self.get_by_type(0x07)
             .and_then(|data| Uuid::from_slice(&data.iter().copied().rev().collect::<Vec<_>>()).ok())
