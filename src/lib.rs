@@ -113,12 +113,14 @@ pub struct MdlVerifier {
     trust_anchors: TrustAnchorRegistry,
     requested_elements: NonEmptyMap<String, NonEmptyMap<String, bool>>,
     streams: StreamMap<String, PinnedConnectionInfoStream>,
+    timeout: u64,
 }
 
 impl MdlVerifier {
     pub fn new(
         certificate_pem_data: Vec<String>,
         requested_elements: HashMap<String, HashMap<String, bool>>,
+        timeout: u64,
     ) -> Result<Self, Error> {
         let requested_elements = Self::non_empty_requested_elements(requested_elements)
             .ok_or(Error::InvalidConfig("must have requested elements"))?;
@@ -140,6 +142,7 @@ impl MdlVerifier {
         Ok(Self {
             trust_anchors,
             requested_elements,
+            timeout,
             streams: Default::default(),
         })
     }
@@ -182,9 +185,14 @@ impl MdlVerifier {
 
         let stream = self.streams.map(|(_name, res)| res);
 
-        ble::attempt_connections(self.trust_anchors, self.requested_elements, stream)
-            .await
-            .map_err(Into::into)
+        ble::attempt_connections(
+            self.trust_anchors,
+            self.requested_elements,
+            self.timeout,
+            stream,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     fn non_empty_requested_elements(

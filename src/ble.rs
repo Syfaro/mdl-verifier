@@ -50,6 +50,7 @@ pub(crate) use find_characteristic;
 pub async fn attempt_connections<S>(
     trust_anchors: TrustAnchorRegistry,
     requested_elements: NonEmptyMap<String, NonEmptyMap<String, bool>>,
+    timeout: u64,
     mut stream: S,
 ) -> Result<Receiver<super::VerifierEvent>, BleError>
 where
@@ -71,7 +72,7 @@ where
         while let Ok(Some(conn_info)) = stream.try_next().await {
             let res = match conn_info.ble_service_mode {
                 crate::BLEServiceMode::PeripheralServer => tokio::time::timeout(
-                    Duration::from_secs(30),
+                    Duration::from_secs(timeout),
                     peripheral::attempt_exchange(
                         &central,
                         requested_elements.clone(),
@@ -86,7 +87,7 @@ where
                 crate::BLEServiceMode::CentralClient => {
                     let token = CancellationToken::new();
 
-                    let timeout_fut = tokio::time::sleep(Duration::from_secs(60));
+                    let timeout_fut = tokio::time::sleep(Duration::from_secs(timeout));
                     tokio::pin!(timeout_fut);
 
                     let exchange_fut = central_manager.attempt_exchange(

@@ -20,6 +20,8 @@ struct Config {
 
     #[clap(short = 'c', long, env)]
     certificates_path: PathBuf,
+    #[clap(short = 't', long, env, default_value = "120")]
+    timeout: u64,
 
     #[clap(short = 'n', long, env)]
     nfc_connstring: Option<String>,
@@ -43,15 +45,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let mut verifier = mdl_verifier::MdlVerifier::new(
-        load_certificates(config.certificates_path).await?,
-        [(
-            "org.iso.18013.5.1".to_string(),
-            [("age_over_21".to_string(), false)].into_iter().collect(),
-        )]
-        .into_iter()
-        .collect(),
-    )?;
+    let certificates = load_certificates(config.certificates_path).await?;
+
+    let elements = [(
+        "org.iso.18013.5.1".to_string(),
+        [("age_over_21".to_string(), false)].into_iter().collect(),
+    )]
+    .into_iter()
+    .collect();
+
+    let mut verifier = mdl_verifier::MdlVerifier::new(certificates, elements, config.timeout)?;
 
     if let Some(scanner_path) = config.scanner_path {
         let scanner_stream = create_scanner_stream(scanner_path, config.scanner_baud).await?;

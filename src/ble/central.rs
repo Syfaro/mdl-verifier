@@ -139,6 +139,8 @@ impl CentralManager {
             .run_until_cancelled(self.exchange_data(session_request, ready_rx, data_rx))
             .await;
 
+        self.pending_services.lock().unwrap().remove(&service_uuid);
+
         // TODO: doesn't look like there's a way to remove services right now
         self.advertised_services.remove(&service_uuid);
         self.advertise_services().await?;
@@ -245,7 +247,7 @@ impl CentralManager {
                 PeripheralEvent::ReadRequest {
                     request, responder, ..
                 } => {
-                    warn!(%request.characteristic, "got unexpected read request");
+                    warn!(%request.service, %request.characteristic, "got unexpected read request");
                     responder
                         .send(ReadRequestResponse {
                             value: vec![],
@@ -261,8 +263,9 @@ impl CentralManager {
                 } => {
                     trace!(
                         %request.service,
+                        %request.characteristic,
                         offset,
-                        "got write request: {request:?}, {}",
+                        "got write request: {}",
                         hex::encode(&value)
                     );
                     match request.characteristic {

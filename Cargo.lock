@@ -695,6 +695,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f46ad14479a25103f283c0f10005961cf086d8dc42205bb44c46ac563475dca6"
 
 [[package]]
+name = "cmake"
+version = "0.1.54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7caa3f9de89ddbe2c607f4101924c5abec803763ae9534e4f4d7d8f84aa81f0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2099,6 +2108,7 @@ version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06085512b750d640299b79be4bad3d2fa90a9c00b1fd9e1b46364f66f0485c72"
 dependencies = [
+ "cc",
  "pkg-config",
 ]
 
@@ -2117,6 +2127,18 @@ name = "libm"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8355be11b20d696c8f18f6cc018c4e372165b1fa8126cef092399c9951984ffa"
+
+[[package]]
+name = "libusb1-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22e89d08bbe6816c6c5d446203b859eba35b8fa94bf1b7edb2f6d25d43f023f"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "vcpkg",
+]
 
 [[package]]
 name = "linked-data"
@@ -2227,6 +2249,7 @@ dependencies = [
  "btleplug",
  "ciborium",
  "clap",
+ "dbus",
  "futures",
  "hex",
  "hex-literal 1.0.0",
@@ -2330,8 +2353,11 @@ checksum = "6652c6cdf52433ff143439595ffb4b945afafbe5f27cec8d2fc5dfb5832796e8"
 dependencies = [
  "bindgen",
  "cc",
+ "cmake",
  "find-winsdk",
+ "libusb1-sys",
  "pkg-config",
+ "usb-compat-01-sys",
  "vcpkg",
 ]
 
@@ -3978,6 +4004,18 @@ name = "unsigned-varint"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6889a77d49f1f013504cec6bf97a2c730394adedaeb1deb5ea08949a50541105"
+
+[[package]]
+name = "usb-compat-01-sys"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd959743cc4f52cbe10f5724620becf59a568ba2f8d84e86eea96d3164225cd0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "libusb1-sys",
+ "pkg-config",
+]
 
 [[package]]
 name = "utf8-decode"
