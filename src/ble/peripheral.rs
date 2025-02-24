@@ -52,7 +52,7 @@ pub async fn attempt_exchange(
         })
         .await
         .map_err(BleError::Btleplug)?;
-    debug!(service_uuid = %service_uuid, "starting scan for service");
+    trace!(service_uuid = %service_uuid, "starting scan for service");
 
     let peripheral_id = loop {
         match events.next().await {
@@ -186,10 +186,10 @@ pub async fn attempt_exchange(
     trace!("wrote end");
 
     peripheral.disconnect().await.map_err(BleError::Btleplug)?;
-    trace!("disconnected from peripheral");
+    debug!("disconnected from peripheral");
 
     let validated = reader_sm.handle_response(&response);
-    debug!("{validated:?}");
+    trace!("{validated:?}");
 
     Ok(validated)
 }

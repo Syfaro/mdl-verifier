@@ -144,7 +144,7 @@ pub fn start_nfc_thread(
                     }
                 };
 
-                info!(
+                debug!(
                     le_role = ?connection.le_role,
                     service_uuid = %connection.service_uuid,
                     "got connection details"
@@ -305,7 +305,7 @@ impl<'a> NfcReader<'a> {
                     return self.process_ndef_data(ndef_file_data);
                 }
                 KnownNdefRecord::HandoverSelect(select) => {
-                    debug!("got handover select: {select:?}");
+                    trace!("got handover select: {select:?}");
 
                     for alt_carrier in select.alternative_carriers {
                         let Some(KnownNdefRecord::BluetoothCarrierConfiguration(ble_config)) =

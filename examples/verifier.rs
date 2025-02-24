@@ -10,6 +10,7 @@ use tokio::{
 };
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, level_filters::LevelFilter};
 use tracing_subscriber::EnvFilter;
 
@@ -65,7 +66,8 @@ async fn main() -> anyhow::Result<()> {
         verifier.add_nfc_stream(nfc_connstring)?;
     }
 
-    let mut events = verifier.start().await?;
+    let token = CancellationToken::new();
+    let mut events = verifier.start(token).await?;
 
     while let Some(event) = events.recv().await {
         info!("got event: {event:?}");

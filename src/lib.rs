@@ -12,6 +12,7 @@ use isomdl::{
 use thiserror::Error;
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::{StreamExt, StreamMap, wrappers::ReceiverStream};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod ble;
@@ -112,8 +113,8 @@ pub type PinnedConnectionInfoStream =
 pub struct MdlVerifier {
     trust_anchors: TrustAnchorRegistry,
     requested_elements: NonEmptyMap<String, NonEmptyMap<String, bool>>,
-    streams: StreamMap<String, PinnedConnectionInfoStream>,
     timeout: u64,
+    streams: StreamMap<String, PinnedConnectionInfoStream>,
 }
 
 impl MdlVerifier {
@@ -153,7 +154,7 @@ impl MdlVerifier {
     {
         self.add_stream(
             "qr",
-            Box::pin(stream.map(qr_to_needed)) as PinnedConnectionInfoStream,
+            Box::pin(stream.map(qr_to_connection_info)) as PinnedConnectionInfoStream,
         );
 
         self
@@ -161,7 +162,7 @@ impl MdlVerifier {
 
     pub fn add_nfc_stream(&mut self, connstring: String) -> Result<&mut Self, Error> {
         let nfc_rx = nfc::start_nfc_thread(connstring)?;
-        let nfc_stream = ReceiverStream::new(nfc_rx).map(nfc_to_needed);
+        let nfc_stream = ReceiverStream::new(nfc_rx).map(nfc_to_connection_info);
 
         self.add_stream("nfc", Box::pin(nfc_stream) as PinnedConnectionInfoStream);
 
@@ -176,7 +177,7 @@ impl MdlVerifier {
         self
     }
 
-    pub async fn start(self) -> Result<Receiver<VerifierEvent>, Error> {
+    pub async fn start(self, token: CancellationToken) -> Result<Receiver<VerifierEvent>, Error> {
         if self.streams.is_empty() {
             return Err(Error::InvalidConfig(
                 "at least one stream must be specified",
@@ -189,6 +190,7 @@ impl MdlVerifier {
             self.trust_anchors,
             self.requested_elements,
             self.timeout,
+            token,
             stream,
         )
         .await
@@ -210,25 +212,7 @@ impl MdlVerifier {
     }
 }
 
-fn nfc_to_needed(
-    connection: nfc::NegotiatedConnection,
-) -> Result<StreamConnectionInfo, BoxedError> {
-    let device_engagement_bytes =
-        Tag24::<DeviceEngagement>::from_bytes(connection.device_engagement)
-            .map_err(VerifyError::DeviceEngagement)?;
-
-    Ok(StreamConnectionInfo {
-        ble_service_mode: connection.le_role.into(),
-        ble_service_uuid: connection.service_uuid,
-        device_engagement_bytes,
-        handover_type: HandoverType::Nfc {
-            handover_select_bytes: connection.handover_select,
-            handover_request_bytes: connection.handover_request,
-        },
-    })
-}
-
-fn qr_to_needed(engagement: String) -> Result<StreamConnectionInfo, BoxedError> {
+fn qr_to_connection_info(engagement: String) -> Result<StreamConnectionInfo, BoxedError> {
     let device_engagement_bytes = Tag24::<DeviceEngagement>::from_qr_code_uri(&engagement)
         .map_err(|err| {
             VerifyError::DeviceEngagementQr(
@@ -269,5 +253,23 @@ fn qr_to_needed(engagement: String) -> Result<StreamConnectionInfo, BoxedError> 
         ble_service_uuid,
         device_engagement_bytes,
         handover_type: HandoverType::Qr,
+    })
+}
+
+fn nfc_to_connection_info(
+    connection: nfc::NegotiatedConnection,
+) -> Result<StreamConnectionInfo, BoxedError> {
+    let device_engagement_bytes =
+        Tag24::<DeviceEngagement>::from_bytes(connection.device_engagement)
+            .map_err(VerifyError::DeviceEngagement)?;
+
+    Ok(StreamConnectionInfo {
+        ble_service_mode: connection.le_role.into(),
+        ble_service_uuid: connection.service_uuid,
+        device_engagement_bytes,
+        handover_type: HandoverType::Nfc {
+            handover_select_bytes: connection.handover_select,
+            handover_request_bytes: connection.handover_request,
+        },
     })
 }
