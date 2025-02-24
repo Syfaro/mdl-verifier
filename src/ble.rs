@@ -8,7 +8,6 @@ use tokio::{
     sync::mpsc::{Receiver, channel},
     time::sleep,
 };
-use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -55,7 +54,7 @@ pub async fn attempt_connections<S>(
     requested_elements: NonEmptyMap<String, NonEmptyMap<String, bool>>,
     timeout: u64,
     token: CancellationToken,
-    mut stream: S,
+    stream: S,
 ) -> Result<Receiver<super::VerifierEvent>, BleError>
 where
     S: futures::Stream<Item = Result<super::StreamConnectionInfo, super::BoxedError>>
@@ -73,7 +72,10 @@ where
     let (tx, rx) = channel(1);
 
     tokio::spawn(async move {
-        while let Ok(Some(conn_info)) = stream.try_next().await {
+        let stream = futures::StreamExt::take_until(stream, token.cancelled());
+        tokio::pin!(stream);
+
+        while let Ok(Some(conn_info)) = tokio_stream::StreamExt::try_next(&mut stream).await {
             let exchange_token = token.child_token();
 
             let timeout_fut = sleep(Duration::from_secs(timeout));
