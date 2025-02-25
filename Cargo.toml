@@ -5,9 +5,6 @@ edition = "2024"
 license = "MIT"
 authors = ["Syfaro <syfaro@huefox.com>"]
 
-[features]
-vendored = ["dbus/vendored", "nfc1/vendored"]
-
 [dependencies]
 ble-peripheral-rust = "0.2.0"
 btleplug = "0.11.7"
@@ -27,13 +24,10 @@ uuid = { version = "1.14.0", features = ["v4"] }
 
 [dev-dependencies]
 anyhow = "1.0.96"
-clap = { version = "4.5.30", features = ["derive", "env"] }
+clap = { version = "4.5.31", features = ["derive", "env"] }
 hex-literal = "1.0.0"
 tokio-serial = "5.4.5"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
 [[example]]
 name = "verifier"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-dbus = { version = "0.9.7", features = ["vendored"], optional = true }
