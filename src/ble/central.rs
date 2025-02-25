@@ -39,13 +39,16 @@ const IDENT_ID: Uuid = uuid!("00000008-A123-48CE-896B-4C76973373E6");
 type PendingServices = Arc<Mutex<HashMap<Uuid, PendingService>>>;
 
 struct PendingService {
+    ble_ident: Vec<u8>,
     ready_to_send: Option<oneshot::Sender<()>>,
     received_data: Option<oneshot::Sender<Vec<u8>>>,
     buf: Vec<u8>,
 }
 
 impl PendingService {
-    fn new() -> (
+    fn new(
+        ble_ident: Vec<u8>,
+    ) -> (
         PendingService,
         oneshot::Receiver<()>,
         oneshot::Receiver<Vec<u8>>,
@@ -55,6 +58,7 @@ impl PendingService {
 
         (
             PendingService {
+                ble_ident,
                 ready_to_send: Some(ready_to_send),
                 received_data: Some(received_data),
                 buf: Vec::new(),
@@ -121,7 +125,7 @@ impl CentralManager {
 
         let service = Self::create_service(service_uuid, ble_ident.to_vec());
 
-        let (pending_service, ready_rx, data_rx) = PendingService::new();
+        let (pending_service, ready_rx, data_rx) = PendingService::new(ble_ident.to_vec());
         self.pending_services
             .lock()
             .unwrap()
@@ -245,9 +249,37 @@ impl CentralManager {
         while let Some(event) = event_rx.recv().await {
             match event {
                 PeripheralEvent::ReadRequest {
-                    request, responder, ..
+                    request,
+                    offset,
+                    responder,
+                } if request.characteristic == IDENT_ID => {
+                    trace!(
+                        %request.service,
+                        %request.characteristic,
+                        offset,
+                        "got ident read request",
+                    );
+                    let resp = match pending_services.lock().unwrap().get(&request.service) {
+                        Some(service) => ReadRequestResponse {
+                            value: service.ble_ident.clone(),
+                            response: RequestResponse::Success,
+                        },
+                        None => ReadRequestResponse {
+                            value: vec![],
+                            response: RequestResponse::RequestNotSupported,
+                        },
+                    };
+
+                    responder
+                        .send(resp)
+                        .map_err(|err| BleError::BlePeripheralResponse(err.response))?
+                }
+                PeripheralEvent::ReadRequest {
+                    request,
+                    offset,
+                    responder,
                 } => {
-                    warn!(%request.service, %request.characteristic, "got unexpected read request");
+                    warn!(%request.service, %request.characteristic, offset, "got unexpected read request");
                     responder
                         .send(ReadRequestResponse {
                             value: vec![],
